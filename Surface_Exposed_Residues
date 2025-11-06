@@ -1,0 +1,212 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+PyMOL Script: Find Surface Exposed Residues (v3 - Chain Selection)
+
+This script calculates the Solvent Accessible Surface Area (SASA) for each residue
+in a PDB structure and identifies those that are "surface-exposed" based on a
+percentage cutoff.
+
+It now includes an option to select specific chains for analysis.
+
+Reference Max SASA values are from:
+Tien, M. Z., Meyer, A. G., Sydykova, D. K., Spielman, S. J., & Wilke, C. O. (2013).
+Maximum allowed solvent accessibilities of residues in proteins.
+PLoS ONE, 8(11), e80635.
+"""
+
+from pymol import cmd
+import os
+
+# --- Reference Max SASA values (Tien et al., 2013) ---
+MAX_SASA = {
+    'ALA': 129.0, 'ARG': 274.0, 'ASN': 195.0, 'ASP': 193.0,
+    'CYS': 167.0, 'GLN': 225.0, 'GLU': 223.0, 'GLY': 104.0,
+    'HIS': 224.0, 'ILE': 197.0, 'LEU': 201.0, 'LYS': 236.0,
+    'MET': 224.0, 'PHE': 240.0, 'PRO': 159.0, 'SER': 155.0,
+    'THR': 172.0, 'TRP': 304.0, 'TYR': 263.0, 'VAL': 174.0
+}
+# ---------------------------------------------------
+
+def find_surface_residues(pdb_file, output_file, chains_to_analyze=None, cutoff=30.0, select_exposed=True):
+    """
+    Calculates and saves surface-exposed residues from a PDB file.
+
+    Args:
+        pdb_file (str): Path to the input PDB file.
+        output_file (str): Path to save the resulting CSV file.
+        chains_to_analyze (list, optional): A list of chain IDs to analyze,
+                                            e.g., ["A", "B"]. If None or empty,
+                                            all chains are analyzed.
+        cutoff (float): The percentage SASA cutoff (default: 30.0).
+        select_exposed (bool): If True, creates a PyMOL selection
+                               'surface_exposed' (default: True).
+    """
+
+    # --- 1. Setup and Load ---
+    print(f"Initializing for {pdb_file}...")
+    # Use reinitialize to clear everything
+    cmd.reinitialize()
+
+    if not os.path.exists(pdb_file):
+        print(f"Error: PDB file not found at {pdb_file}")
+        return
+
+    obj_name = os.path.splitext(os.path.basename(pdb_file))[0]
+    cmd.load(pdb_file, obj_name)
+
+    # --- 2. Chain Selection (NEW) ---
+    # If a list of chains is provided, remove all other chains
+    if chains_to_analyze:
+        # PyMOL chain selection string is "chain A,B,C"
+        chain_sele_str = f"chain {','.join(chains_to_analyze)}"
+        print(f"Isolating specified chains: {chain_sele_str}")
+        
+        # Remove all atoms that are NOT in the specified chains from the loaded object
+        cmd.remove(f"not ({chain_sele_str}) and model {obj_name}")
+    else:
+        print("Analyzing all chains (no chain filter specified).")
+
+
+    # --- 3. Clean up structure ---
+    # Remove water molecules
+    cmd.remove(f"solvent and model {obj_name}")
+    
+    # Handle alternate locations, which can inflate SASA values.
+    # We create a new object "cleaned" containing only alt loc A or blank locs.
+    # This will now only contain atoms from the chains we selected (if any).
+    print("Removing alternate locations (keeping A and blank)...")
+    cleaned_obj_name = f"{obj_name}_cleaned"
+    cmd.create(cleaned_obj_name, f"({obj_name}) and (alt '' or alt 'A')")
+    
+    # --- 4. Calculate SASA ---
+    # Set standard SASA calculation parameters
+    cmd.set("solvent_radius", 1.4)
+    cmd.set("dot_solvent", 1)
+    cmd.set("dot_density", 3)
+
+    # We run this on the CLEANED object
+    # For NMR structures, this calculates on State 1 and stores b-factors in State 1
+    print(f"Calculating Solvent Accessible Surface Area (SASA) on {cleaned_obj_name} (State 1)...")
+    cmd.get_area(cleaned_obj_name, load_b=1)
+
+    # --- 5. Iterate Atoms to Sum SASA per Residue ---
+    # We create an explicit dictionary to pass, avoiding `space=locals()`
+    my_sasa_dict = {}
+    
+    # We iterate over STATE 1 of the CLEANED object
+    # We store (chain, resi, resn, resv) as the key.
+    # resi = string (e.g., "10A"), resv = integer (e.g., 10)
+    print(f"Summing SASA values for residues in State 1...")
+    cmd.iterate_state(1, cleaned_obj_name,
+                      "my_sasa_dict.setdefault((chain, resi, resn, resv), 0.0); "
+                      "my_sasa_dict[(chain, resi, resn, resv)] += b",
+                      space={'my_sasa_dict': my_sasa_dict})
+
+    if not my_sasa_dict:
+        print("Error: Could not retrieve residue SASA. Is the object empty?")
+        return
+
+    # --- 6. Process and Write to File ---
+    print(f"Writing exposed residues to {output_file}...")
+    exposed_selection_list = []
+    
+    # Sort keys for a clean output file
+    # We sort by chain (r[0]) and then by integer residue number (r[3])
+    # This is safer than int(resi) and handles insertion codes.
+    sorted_residues = sorted(my_sasa_dict.keys(), key=lambda r: (r[0], r[3]))
+    
+    print(f"Processing {len(sorted_residues)} total residues (including non-standard)...")
+
+    with open(output_file, 'w') as f:
+        # Write header
+        f.write("Chain,ResID,ResName,ResidueSASA,MaxSASA,PercentSASA\n")
+        
+        all_residue_data = []
+
+        # Unpack the new key structure
+        for (chain, resi, resn, resv) in sorted_residues:
+            sasa = my_sasa_dict[(chain, resi, resn, resv)]
+
+            # Check if it's a standard residue
+            if resn in MAX_SASA:
+                max_val = MAX_SASA[resn]
+                
+                if max_val > 0:
+                    percent_sasa = (sasa / max_val) * 100.0
+                else:
+                    percent_sasa = 0.0
+
+                # Store for debugging
+                all_residue_data.append(f"{chain},{resi},{resn},{percent_sasa:.2f}%")
+
+                # Check if it meets the cutoff
+                if percent_sasa >= cutoff:
+                    # Write to file
+                    f.write(f"{chain},{resi},{resn},{sasa:.2f},{max_val:.2f},{percent_sasa:.2f}\n")
+                    
+                    # Add to our selection list
+                    if select_exposed:
+                        # We must specify the object name in the selection
+                        exposed_selection_list.append(f"(chain {chain} and resi {resi} and model {cleaned_obj_name})")
+            
+            else:
+                # Handle non-standard residues
+                print(f"Skipping non-standard residue: {chain} {resi} {resn}")
+
+    print(f"Successfully wrote {len(exposed_selection_list)} exposed residues.")
+
+    # --- DEBUGGING: Print all values if list is small ---
+    if len(all_residue_data) > 0 and len(all_residue_data) < 50:
+        print("\n--- All Residue Percent SASA (for debugging) ---")
+        for line in all_residue_data:
+            print(line)
+        print("------------------------------------------------\n")
+
+
+    # --- 7. Create PyMOL Selection ---
+    if select_exposed and exposed_selection_list:
+        selection_name = "surface_exposed"
+        selection_string = " or ".join(exposed_selection_list)
+        cmd.select(selection_name, selection_string)
+        print(f"Created selection '{selection_name}' with {len(exposed_selection_list)} residues.")
+        
+        # Also color them and show as sticks for visibility
+        cmd.color("yellow", selection_name)
+        cmd.show("sticks", selection_name)
+        cmd.show("cartoon")
+        cmd.zoom(selection_name)
+    elif select_exposed:
+        print("No residues met the cutoff. No selection created.")
+
+    
+    print("Script finished.")
+
+# --- HOW TO USE ---
+# 1. Change the parameters in the "Parameters to Customize" section below.
+# 2. Save this file.
+# 3. In PyMOL, go to File > Run Script... and select this file.
+# 4. The script will run automatically.
+
+# --- Parameters to Customize ---
+PDB_FILE_PATH = r"XXX"  # <-- IMPORTANT: Set your PDB file path here
+OUTPUT_FILE_PATH = "XXX.csv" # <-- Set your desired output CSV file path
+
+# Specify chains to analyze, e.g., ["A", "B"].
+# Set to None or [] to analyze ALL chains in the file.
+CHAINS_TO_ANALYZE = ["A"]                   # <-- Set chains here, e.g., ["A"] or None
+
+SASA_CUTOFF_PERCENT = 30.0                  # The % SASA cutoff to define "exposed"
+CREATE_PYMOL_SELECTION = True               # True to create a PyMOL selection, False to skip
+
+# --- Run the function ---
+print("--- Running Surface Residue Analysis (v3 - Chain Selection) ---")
+find_surface_residues(
+    PDB_FILE_PATH,
+    OUTPUT_FILE_PATH,
+    chains_to_analyze=CHAINS_TO_ANALYZE,
+    cutoff=SASA_CUTOFF_PERCENT,
+    select_exposed=CREATE_PYMOL_SELECTION
+)
+print("--- Analysis Finished ---")
